@@ -17,7 +17,7 @@
 
 """MACA permute_layout dispatch: Wave64 register-staged in-place transpose.
 
-The optional per-lane XOR swizzle avoids SMEM bank conflicts on the write phase.
+The optional per-lane XOR swizzle can avoid shared-memory bank conflicts.
 
 The dispatcher reasons about the **layout's shard**, not the buffer's
 declared shape (the two can differ — a buffer with ``shape=(PIPE, M, K)``
@@ -35,29 +35,21 @@ mapping shard segments onto buffer dims).  Concretely:
     src_str = [int(it.stride) for it in src_sliced.shard]
     dst_str = [int(it.stride) for it in dst_sliced.shard]
 
-The algorithm:
+The algorithm uses ``active_lanes`` and ``slots`` derived from the slice
+volume.  Each lane stages ``flat = lane + slot * active_lanes`` and projects
+that flat index through the source and destination layouts.  XOR changes only
+the register-slot order; automatic selection currently requires a nonzero,
+bank-certified schedule for shared/shared 4-byte scalar buffers with at most
+32 slots.  The generic emitter handles every remaining valid scalar plan.
 
-    regs[P]
-    for r in 0..P:
-        j  = r XOR ((lane >> SHIFT) & MASK)
-        i  = lane + j * 32                             # flat logical index
-        idx = decompose(i, extent)                     # iter multi-dim index
-        regs[r] = src[project(idx, src.shape, slice_starts)]
-    warp_sync()
-    for r in 0..P:
-        j  = r XOR ((lane >> SHIFT) & MASK)
-        i  = lane + j * 32
-        idx = decompose(i, extent)
-        dst[project(idx, dst.shape, slice_starts)] = regs[r]
-    warp_sync()
-
-where ``project`` mixed-radix-folds the iter shard dims back onto the
+``project`` mixed-radix-folds the iter shard dims back onto the
 buffer's iterated slice dims (so the emit's index matches buf.shape rank,
 which TIR's BufferLoad/Store requires).
 
-SHIFT and MASK are chosen by simulating the bank pattern at the **shard
-granularity** (where strides are affine), trying k = 0, 1, …, log2(P)
-and picking the smallest k that makes both phases bank-conflict-free.
+``shift`` and ``mask`` are chosen by simulating the bank pattern at the shard
+granularity and picking the smallest nonzero ``k`` that makes both phases
+bank-conflict-free. Certification is limited to power-of-two slot counts in
+``1..32``.
 
 Correctness rests on:
 
@@ -215,8 +207,9 @@ def _bank_free(extent, strides, dtype_bytes, P, k, active_lanes=ACTIVE_LANES):
 
 def _choose_xor_k(extent, src_strides, dst_strides, dtype_bytes, P, active_lanes=ACTIVE_LANES):
     """Pick the smallest XOR bit count valid for both load and store layouts."""
-    max_k = int(math.log2(P)) if P > 0 else 0
-    for k in range(max_k + 1):
+    if P <= 0 or P > 32 or P & (P - 1):
+        return None
+    for k in range(P.bit_length()):
         if _bank_free(extent, src_strides, dtype_bytes, P, k, active_lanes) and _bank_free(
             extent, dst_strides, dtype_bytes, P, k, active_lanes
         ):
@@ -276,8 +269,10 @@ def analyze_common(op_call, sctx):
         return None, f"slice shape mismatch: src={src_ext_i} vs dst={dst_ext_i}"
 
     dtype = DataType(src_buf.dtype)
+    if dtype.lanes != 1:
+        return None, "permute_layout requires scalar elements; vector elements are not supported"
     if dtype.bits % 8 != 0 or dtype.bits // 8 not in (1, 2, 4, 8):
-        return None, "permute_layout requires 1, 2, 4, or 8-byte elements"
+        return None, "permute_layout requires 1, 2, 4, or 8-byte scalar elements"
     dtype_bytes = dtype.bits // 8
 
     if not isinstance(src_buf.layout, TileLayout):
@@ -426,8 +421,15 @@ def _dispatch_plan(op, sctx):
 @register_dispatch("permute_layout", "maca", variant="wave64_xor", priority=40)
 def permute_layout_xor(op: TilePrimitiveCall, sctx: DispatchContext) -> PrimFunc:
     plan = _dispatch_plan(op, sctx)
+    if not (
+        plan["src_buf"].scope().startswith("shared")
+        and plan["dst_buf"].scope().startswith("shared")
+    ):
+        fail("XOR optimization is currently selected only for shared/shared buffers")
     if plan["dtype_bytes"] != 4 or plan["active_lanes"] not in (32, 64):
         fail("XOR variant requires 32-bit elements and 32/64 active lanes")
+    if plan["slots"] > 32:
+        fail("XOR optimization supports at most 32 register slots")
     if plan["slots"] & (plan["slots"] - 1):
         fail("XOR variant requires a power-of-two slot count")
     k = _choose_xor_k(
@@ -440,25 +442,9 @@ def permute_layout_xor(op: TilePrimitiveCall, sctx: DispatchContext) -> PrimFunc
     )
     if k is None:
         fail("no certified conflict-free XOR schedule")
+    if k == 0:
+        fail("XOR schedule is unswizzled; generic staging is preferred")
     return _emit(plan, k)
-
-
-@register_dispatch("permute_layout", "maca", variant="wave64_direct", priority=30)
-def permute_layout_direct(op: TilePrimitiveCall, sctx: DispatchContext) -> PrimFunc:
-    plan = _dispatch_plan(op, sctx)
-    if plan["src_buf"].scope().startswith("shared") or plan["dst_buf"].scope().startswith("shared"):
-        fail("direct variant is for non-shared buffers")
-    return _emit(plan)
-
-
-@register_dispatch("permute_layout", "maca", variant="wave64_shared_two_batch", priority=25)
-def permute_layout_shared(op: TilePrimitiveCall, sctx: DispatchContext) -> PrimFunc:
-    plan = _dispatch_plan(op, sctx)
-    if not (
-        plan["src_buf"].scope().startswith("shared") or plan["dst_buf"].scope().startswith("shared")
-    ):
-        fail("shared-two-batch variant requires shared storage")
-    return _emit(plan)
 
 
 @register_dispatch("permute_layout", "maca", variant="wave64_generic", priority=10)
@@ -476,9 +462,7 @@ __all__ = [
     "_decompose_row_major",
     "_eval_offset",
     "analyze_common",
-    "permute_layout_direct",
     "permute_layout_dispatch",
     "permute_layout_generic",
-    "permute_layout_shared",
     "permute_layout_xor",
 ]

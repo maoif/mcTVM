@@ -31,20 +31,22 @@ memory path. Source:
 MACA variants
 -------------
 
-MACA registers ``wave64_xor`` (priority 40), ``wave64_direct`` (30),
-``wave64_shared_two_batch`` (25), and ``wave64_generic`` (10). All require
-warp scope, a one-dimensional full Wave64 lane range
-``[0, 64)``, equal static slice extents, plain ``TileLayout`` objects, and
-bijective sliced layouts. Element widths of 1, 2, 4, and 8 bytes are supported.
+MACA registers two variants: ``wave64_xor`` (priority 40) and
+``wave64_generic`` (priority 10). Both require warp scope, a one-dimensional
+full Wave64 lane range ``[0, 64)``, equal static slice extents, plain
+``TileLayout`` objects, and bijective sliced layouts. Scalar element widths of
+1, 2, 4, and 8 bytes are supported. Vector elements and 16-byte scalar
+elements are rejected explicitly.
 
 For volume ``V``, the active lane count is
 ``min(64, next_power_of_two(V))`` and each lane gets
 ``ceil(V / active_lanes)`` register slots. Every memory access is guarded by
 ``lane_id < active_lanes`` and ``flat < V``, so non-power-of-two volumes are
-valid. ``wave64_xor`` is only an optimization for 4-byte data, power-of-two
-slots, and a certified common XOR schedule. If that schedule is unavailable,
-dispatch falls through to direct/shared/generic lowering; bank conflicts never
-make a valid operation fail.
+valid. ``wave64_xor`` is an optimization for 4-byte scalar data only. Automatic
+selection requires shared/shared operands, ``slots <= 32``, and a certified
+nonzero XOR bit count ``k`` that is bank-free for both layouts. The generic
+variant handles every other valid storage scope and every valid layout for
+which that schedule is unavailable.
 
 Every variant performs complete register loads, an unconditional
 ``T.maca.warp_sync()``, complete stores, and a second unconditional barrier
@@ -63,7 +65,8 @@ The implementation first builds a common permutation plan:
     if "threadIdx.y" in launch or "threadIdx.z" in launch: return "multi-dim threadIdx"
     if src_buf.dtype != dst_buf.dtype:             return "dtype mismatch"
     if src_ext_i != dst_ext_i:                     return "extent mismatch"
-    if dtype_bytes not in (1, 2, 4, 8):             return "unsupported element width"
+    if dtype.lanes != 1:                            return "vector elements are not supported"
+    if dtype_bytes not in (1, 2, 4, 8):             return "unsupported scalar element width"
     if not isinstance(src_buf.layout, TileLayout): return "src not a plain TileLayout"
     if not isinstance(dst_buf.layout, TileLayout): return "dst not a plain TileLayout"
     # + layouts must slice, regroup, and define bijections on the slice
@@ -77,19 +80,22 @@ The implementation first builds a common permutation plan:
    * - Property
      - Requirement
    * - target / scope / priority
-     - ``maca``; **warp** scope only; priorities ``40/30/25/10``
+     - ``maca``; **warp** scope only; ``wave64_xor`` priority 40 and
+       ``wave64_generic`` priority 10
    * - operands
      - equal dtype, equal (compile-time) extents; both plain ``TileLayout`` (no
-       swizzle wrapper); dtype byte width ∈ {1, 2, 4, 8}; ordinary typed
-       buffer loads and stores
+       swizzle wrapper); scalar dtype byte width ∈ {1, 2, 4, 8}; vector and
+       16-byte scalar elements are rejected; ordinary typed buffer loads and
+       stores
    * - launch / volume
      - one-dimensional full Wave64; any nonzero static slice volume
    * - layout mapping
      - after slicing and regrouping, source and destination describe the same
        iteration extents and each is a bijection on the slice
    * - bank-freedom
-     - XOR bank-freedom is required only by ``wave64_xor``; lower-priority
-       variants remain eligible when no schedule exists
+     - automatic XOR selection is shared/shared-only, requires ``slots <= 32``
+       and a nonzero certified ``k``; ``wave64_generic`` remains eligible for
+       all valid scopes and layouts
 
 Demonstration program
 ----------------------
@@ -124,8 +130,14 @@ and the per-side strides ``src_str`` / ``dst_str``. The plan computes
 ``active_lanes`` and ``slots = ceil(volume / active_lanes)``.
 
 **2. Choose a variant.** ``wave64_xor`` simulates both 32-lane service
-batches and chooses the smallest conflict-free XOR schedule. If none exists,
-the direct/shared/generic variants remain eligible.
+batches and chooses the smallest nonzero conflict-free XOR schedule. The
+certification search is limited to power-of-two ``slots`` in ``1..32`` and
+checks both the source and destination shared-memory bank patterns. Automatic
+XOR selection is currently limited to shared/shared operands. XOR only changes
+register-slot order, so the transform is mathematically valid for mixed
+storage too; the mixed-storage policy is deferred until the shared operand's
+bank behavior and the non-shared operand's access cost have been measured.
+When the policy declines, ``wave64_generic`` handles the valid plan.
 
 **3. Emit two local-staged phases.** Each lane reads its ``slots`` elements through
 the source layout into a local temporary (the swizzle permutes which slot holds
@@ -136,12 +148,14 @@ destination layout:
 
     regs = Tx.alloc_buffer((slots,), dtype, scope="local")
     for r in Tx.unroll(0, slots):
-        flat = lane_id + r * active_lanes
+        slot = r ^ (((lane_id & 31) >> shift) & mask)  # zero for generic
+        flat = lane_id + slot * active_lanes
         if lane_id < active_lanes and flat < volume:
             regs[r] = src_buf[project(decompose(flat, extent), src_st)]
     Tx.maca.warp_sync()
     for r in Tx.unroll(0, slots):
-        flat = lane_id + r * active_lanes
+        slot = r ^ (((lane_id & 31) >> shift) & mask)
+        flat = lane_id + slot * active_lanes
         if lane_id < active_lanes and flat < volume:
             dst_buf[project(decompose(flat, extent), dst_st)] = regs[r]
     Tx.maca.warp_sync()
@@ -174,6 +188,16 @@ Each lane owns column ``threadIdx.x`` and stages its 4 rows through ``regs``; th
 write phase hits distinct banks and transposes the ``4×32`` block for every
 pipeline stage.
 
+MACA vector note
+----------------
+
+Tested shared-memory vector accesses can preserve a shared/shared permutation,
+but vector enablement is deferred. The MACA global-to-shared ``vec_auto`` copy
+path needs a separate fix for full vector element widths, followed by
+end-to-end device tests for default copies and permutation views. Until that
+work is complete, vector elements remain outside the ``permute_layout``
+dispatcher contract.
+
 How inputs change the algorithm
 -------------------------------
 
@@ -188,9 +212,12 @@ How inputs change the algorithm
        per-element index math (the transpose pattern)
    * - dtype byte width
      - feeds the bank simulation in ``_choose_xor_k`` for the optional 4-byte
-       XOR path; unsupported XOR simply falls through to a generic variant
+       XOR path; unsupported XOR simply falls through to ``wave64_generic``
    * - chosen ``k``
-     - sets ``shift`` / ``mask`` of the XOR swizzle (``k = 0`` ⇒ no swizzle)
+     - sets ``shift`` / ``mask`` of the XOR swizzle; automatic XOR requires
+       ``k > 0`` (``k = 0`` is the unswizzled order)
    * - active lanes / slots
      - active lanes are ``min(64, next_power_of_two(volume))`` and slots are
-       ``ceil(volume / active_lanes)``; non-power-of-two slots are valid
+       ``ceil(volume / active_lanes)``; non-power-of-two slots are valid for
+       the generic path, while automatic XOR is certified only for
+       ``slots <= 32``

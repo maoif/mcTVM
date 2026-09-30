@@ -226,9 +226,7 @@ def test_sf_blockwise_transpose(name, pipe, blk, dtype):
 
     [_, B_out], src = _compile_and_run(f, [A_np, B_np])
 
-    # The optimized Wave64 path retains lane-dependent slot arithmetic and
-    # unconditional MACA barriers in the generated source.
-    assert "threadIdx.x" in src and ">>" in src
+    # Register staging keeps the full-wave synchronization around stores.
     assert "syncwarp" in src
 
     # Byte-for-byte equality via numpy reference.
@@ -443,17 +441,7 @@ def test_reject_non_warp_scope():
 @pytest.mark.skipif(not env.has_maca(), reason="need maca")
 @needs_maca
 def test_shared_memory_in_place_alias_safety(dtype):
-    """Compile-only: a shared->shared 32b transpose must take the direct
-    base-ptr + byte-offset ``ld.shared`` / ``st.shared`` path.
-
-    For a 4/8-byte dtype with both operands in shared memory, indexing through
-    ``buf[...]`` lowers the swizzled layout to a per-element IMAD flatten. The
-    direct path computes one base ptr (``ptr_to(stride_offset)``) and adds a
-    compile-time ``off * dtype_bytes`` per register slot, then issues
-    ``T.ptx.ld/st(..., space="shared")``. The bits move through a uint
-    container, so ``float32`` (whose ``ld.b32`` cannot return a float) lowers
-    the same way as the ``uint32`` SF case.
-    """
+    """Typed shared-memory register staging preserves aliased in-place views."""
     shape = (4, 32)
     pre = TileLayout(S[shape : (32, 1)])  # linear
     post = TileLayout(S[shape : (1, 4)])  # transposed within the 128-block
@@ -491,7 +479,7 @@ def test_shared_memory_in_place_alias_safety(dtype):
 @pytest.mark.gpu
 @pytest.mark.skipif(not env.has_maca(), reason="need maca")
 @needs_maca
-@pytest.mark.parametrize("dtype", ["uint8", "uint16", "uint64"])
+@pytest.mark.parametrize("dtype", ["uint8", "uint16", "uint32", "uint64"])
 def test_supported_non_32_bit_elements(dtype):
     shape = (4, 32)
     pre = TileLayout(S[shape : (32, 1)])
@@ -546,8 +534,6 @@ def test_permute_layout_schedule_is_registered_for_maca():
     schedules = list_registered_schedules()
     assert schedules["tirx.tile.permute_layout"]["maca"] == [
         "wave64_xor",
-        "wave64_direct",
-        "wave64_shared_two_batch",
         "wave64_generic",
     ]
 
@@ -571,6 +557,133 @@ def test_reject_unsupported_maca_architecture():
     with target, pytest.raises(RuntimeError) as exc_info:
         tvm.compile(tvm.IRModule({"main": f}), target=target, tir_pipeline="tirx")
     assert "MACA mcpu 'xcore9999' is not one of ('xcore1000',)" in str(exc_info.value)
+
+
+def test_choose_xor_k_rejects_out_of_contract_slots():
+    assert _choose_xor_k([64, 32], [32, 1], [1, 64], 4, 64, 64) is None
+
+
+def _compile_forced_dispatch(dispatch, src_scope="global", dst_scope="global", dtype="uint32"):
+    shape = (4, 32)
+    pre = TileLayout(S[shape : (32, 1)])
+    post = TileLayout(S[shape : (1, 4)])
+
+    @T.prim_func
+    def f(A: T.handle, B: T.handle):
+        A_buf = T.match_buffer(A, shape, dtype, layout=pre)
+        B_buf = T.match_buffer(B, shape, dtype, layout=post)
+        T.device_entry()
+        T.cta_id([1])
+        T.warp_id([1])
+        T.lane_id([64])
+        if src_scope == "shared":
+            storage = T.alloc_buffer((128,), dtype, scope="shared")
+            src = T.decl_buffer(shape, dtype, data=storage.data, scope="shared", layout=pre)
+        else:
+            src = A_buf
+        if dst_scope == "shared":
+            storage = T.alloc_buffer((128,), dtype, scope="shared")
+            dst = T.decl_buffer(shape, dtype, data=storage.data, scope="shared", layout=post)
+        else:
+            dst = B_buf
+        Tx.warp.permute_layout(dst, src, dispatch=dispatch)
+
+    target = tvm.target.Target({"kind": "maca", "mcpu": "xcore1000"})
+    with target:
+        return tvm.compile(tvm.IRModule({"main": f}), target=target, tir_pipeline="tirx")
+
+
+def test_xor_dispatch_requires_shared_shared_and_nonzero_schedule():
+    assert _choose_xor_k([4, 32], [32, 1], [1, 4], 4, 4, 32) == 2
+    with pytest.raises(RuntimeError, match="shared/shared buffers"):
+        _compile_forced_dispatch("wave64_xor")
+    with pytest.raises(RuntimeError, match="shared/shared buffers"):
+        _compile_forced_dispatch("wave64_xor", "shared", "global")
+    with pytest.raises(RuntimeError, match="shared/shared buffers"):
+        _compile_forced_dispatch("wave64_xor", "global", "shared")
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not env.has_maca(), reason="need maca")
+@needs_maca
+@pytest.mark.parametrize("shared_side", ["src", "dst"])
+def test_mixed_shared_global_fallback(shared_side):
+    shape = (4, 32)
+    pre = TileLayout(S[shape : (32, 1)])
+    post = TileLayout(S[shape : (1, 4)])
+
+    @T.prim_func
+    def f(A: T.handle, B: T.handle):
+        A_buf = T.match_buffer(A, shape, "uint32", layout=pre)
+        B_buf = T.match_buffer(B, shape, "uint32", layout=post)
+        T.device_entry()
+        T.cta_id([1])
+        T.warp_id([1])
+        T.lane_id([64])
+        storage = T.alloc_buffer((128,), "uint32", scope="shared")
+        shared_src = T.decl_buffer(shape, "uint32", data=storage.data, scope="shared", layout=pre)
+        shared_dst = T.decl_buffer(shape, "uint32", data=storage.data, scope="shared", layout=post)
+        if shared_side == "src":
+            Tx.cta.copy(shared_src[:, :], A_buf[:, :])
+            T.maca.cta_sync()
+            Tx.warp.permute_layout(B_buf, shared_src)
+        else:
+            Tx.warp.permute_layout(shared_dst, A_buf)
+            T.maca.cta_sync()
+            Tx.cta.copy(B_buf[:, :], shared_dst[:, :])
+
+    A_np = tvm.testing.generate_random_array("uint32", shape)
+    B_np = np.zeros_like(A_np)
+    [_, B_out], src = _compile_and_run(f, [A_np, B_np])
+    ref = _expected_permute(A_np.reshape(-1), [32, 1], [1, 4], list(shape))
+    np.testing.assert_array_equal(B_out.reshape(-1), ref)
+    assert src.count("tvm_builtin_maca_warp_sync();") >= 2
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not env.has_maca(), reason="need maca")
+@needs_maca
+def test_shared_shared_uncertified_schedule_uses_generic_fallback():
+    shape = (64, 32)
+    pre = TileLayout(S[shape : (32, 1)])
+    post = TileLayout(S[shape : (1, 64)])
+    assert _choose_xor_k([64, 32], [32, 1], [1, 64], 4, 32, 64) is None
+
+    @T.prim_func
+    def f(A: T.handle, B: T.handle):
+        A_buf = T.match_buffer(A, shape, "uint32", layout=pre)
+        B_buf = T.match_buffer(B, shape, "uint32", layout=post)
+        T.device_entry()
+        T.cta_id([1])
+        T.warp_id([1])
+        T.lane_id([64])
+        storage = T.alloc_buffer((2048,), "uint32", scope="shared")
+        src_view = T.decl_buffer(shape, "uint32", data=storage.data, scope="shared", layout=pre)
+        dst_view = T.decl_buffer(shape, "uint32", data=storage.data, scope="shared", layout=post)
+        Tx.cta.copy(src_view[:, :], A_buf[:, :])
+        T.maca.cta_sync()
+        Tx.warp.permute_layout(dst_view, src_view)
+        T.maca.cta_sync()
+        Tx.cta.copy(B_buf[:, :], dst_view[:, :])
+
+    A_np = tvm.testing.generate_random_array("uint32", shape)
+    B_np = np.zeros_like(A_np)
+    [_, B_out], src = _compile_and_run(f, [A_np, B_np])
+    ref = _expected_permute(A_np.reshape(-1), [32, 1], [1, 64], list(shape))
+    np.testing.assert_array_equal(B_out.reshape(-1), ref)
+    assert src.count("tvm_builtin_maca_warp_sync();") >= 2
+
+
+@pytest.mark.parametrize(
+    "dtype, message",
+    [
+        ("float32x4", "scalar elements"),
+        ("int128", "1, 2, 4, or 8-byte scalar elements"),
+    ],
+)
+def test_reject_vector_and_128_bit_scalar(dtype, message):
+    with pytest.raises(RuntimeError, match=message):
+        _compile_forced_dispatch("wave64_generic", dtype=dtype)
 
 
 if __name__ == "__main__":
