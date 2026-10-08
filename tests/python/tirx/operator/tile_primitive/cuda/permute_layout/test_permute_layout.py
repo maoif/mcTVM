@@ -54,11 +54,6 @@ from tvm.testing import env
 from tvm.tirx.layout import S, TileLayout
 from tvm.tirx.operator.tile_primitive import list_registered_schedules
 
-pytestmark = pytest.mark.skipif(
-    not env.has_maca_arch("xcore1000"),
-    reason="requires MACA xcore1000",
-)
-
 # ---------------------------------------------------------------------------
 # Algorithm-only tests (no CUDA needed).
 # ---------------------------------------------------------------------------
@@ -153,16 +148,6 @@ def test_dtype_widths_choose_xor_k():
 # ---------------------------------------------------------------------------
 
 
-def _has_maca():
-    try:
-        return tvm.maca(0).exist
-    except Exception:
-        return False
-
-
-needs_maca = pytest.mark.skipif(not _has_maca(), reason="needs MACA")
-
-
 def _compile_and_run(prim_func, np_inputs):
     target = tvm.target.Target({"kind": "maca", "mcpu": "xcore1000"})
     with target:
@@ -181,7 +166,6 @@ def _compile_and_run(prim_func, np_inputs):
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not env.has_maca(), reason="need maca")
-@needs_maca
 @pytest.mark.parametrize(
     "name, pipe, blk, dtype",
     [
@@ -244,7 +228,6 @@ def test_sf_blockwise_transpose(name, pipe, blk, dtype):
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not env.has_maca(), reason="need maca")
-@needs_maca
 def test_identity_passes_through_as_copy():
     """L_src == L_dst should still compile and produce a correct (identity) copy."""
     shape = (4, 32)
@@ -272,7 +255,6 @@ def test_identity_passes_through_as_copy():
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not env.has_maca(), reason="need maca")
-@needs_maca
 @pytest.mark.parametrize("dtype", ["uint32", "int32", "float32"])
 @pytest.mark.parametrize(
     "shape, src_strides, dst_strides",
@@ -439,7 +421,6 @@ def test_reject_non_warp_scope():
 @pytest.mark.parametrize("dtype", ["uint32", "float32"])
 @pytest.mark.gpu
 @pytest.mark.skipif(not env.has_maca(), reason="need maca")
-@needs_maca
 def test_shared_memory_in_place_alias_safety(dtype):
     """Typed shared-memory register staging preserves aliased in-place views."""
     shape = (4, 32)
@@ -478,7 +459,6 @@ def test_shared_memory_in_place_alias_safety(dtype):
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not env.has_maca(), reason="need maca")
-@needs_maca
 @pytest.mark.parametrize("dtype", ["uint8", "uint16", "uint32", "uint64"])
 def test_supported_non_32_bit_elements(dtype):
     shape = (4, 32)
@@ -505,7 +485,6 @@ def test_supported_non_32_bit_elements(dtype):
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not env.has_maca(), reason="need maca")
-@needs_maca
 @pytest.mark.parametrize("volume", [3, 17, 33, 96, 127])
 def test_arbitrary_volume_uses_generic_wave64_path(volume):
     """Non-power-of-two volumes must use guarded generic staging correctly."""
@@ -563,7 +542,7 @@ def test_choose_xor_k_rejects_out_of_contract_slots():
     assert _choose_xor_k([64, 32], [32, 1], [1, 64], 4, 64, 64) is None
 
 
-def _compile_forced_dispatch(dispatch, src_scope="global", dst_scope="global", dtype="uint32"):
+def _lower_forced_dispatch(dispatch, src_scope="global", dst_scope="global", dtype="uint32"):
     shape = (4, 32)
     pre = TileLayout(S[shape : (32, 1)])
     post = TileLayout(S[shape : (1, 4)])
@@ -576,36 +555,58 @@ def _compile_forced_dispatch(dispatch, src_scope="global", dst_scope="global", d
         T.cta_id([1])
         T.warp_id([1])
         T.lane_id([64])
-        if src_scope == "shared":
-            storage = T.alloc_buffer((128,), dtype, scope="shared")
-            src = T.decl_buffer(shape, dtype, data=storage.data, scope="shared", layout=pre)
+        if src_scope != "global":
+            src_storage = T.alloc_buffer((128,), dtype, scope=src_scope)
+            src = T.decl_buffer(shape, dtype, data=src_storage.data, scope=src_scope, layout=pre)
         else:
             src = A_buf
-        if dst_scope == "shared":
-            storage = T.alloc_buffer((128,), dtype, scope="shared")
-            dst = T.decl_buffer(shape, dtype, data=storage.data, scope="shared", layout=post)
+        if dst_scope != "global":
+            dst_storage = T.alloc_buffer((128,), dtype, scope=dst_scope)
+            dst = T.decl_buffer(shape, dtype, data=dst_storage.data, scope=dst_scope, layout=post)
         else:
             dst = B_buf
         Tx.warp.permute_layout(dst, src, dispatch=dispatch)
 
     target = tvm.target.Target({"kind": "maca", "mcpu": "xcore1000"})
     with target:
-        return tvm.compile(tvm.IRModule({"main": f}), target=target, tir_pipeline="tirx")
+        return tvm.tirx.transform.LowerTIRx()(tvm.IRModule({"main": f}))
+
+
+@pytest.mark.parametrize("dispatch", [None, "wave64_xor", "wave64_generic"])
+@pytest.mark.parametrize(
+    "src_scope, dst_scope",
+    [
+        ("local", "global"),
+        ("global", "local"),
+        ("local", "shared"),
+        ("shared", "local"),
+        ("local", "local"),
+    ],
+)
+def test_reject_thread_private_storage(dispatch, src_scope, dst_scope):
+    with pytest.raises(RuntimeError, match="requires global or shared storage"):
+        _lower_forced_dispatch(dispatch, src_scope, dst_scope)
+
+
+@pytest.mark.parametrize("dispatch", [None, "wave64_generic"])
+@pytest.mark.parametrize("src_scope", ["global", "shared"])
+@pytest.mark.parametrize("dst_scope", ["global", "shared"])
+def test_supported_storage_scopes_lower(dispatch, src_scope, dst_scope):
+    _lower_forced_dispatch(dispatch, src_scope, dst_scope)
 
 
 def test_xor_dispatch_requires_shared_shared_and_nonzero_schedule():
     assert _choose_xor_k([4, 32], [32, 1], [1, 4], 4, 4, 32) == 2
     with pytest.raises(RuntimeError, match="shared/shared buffers"):
-        _compile_forced_dispatch("wave64_xor")
+        _lower_forced_dispatch("wave64_xor")
     with pytest.raises(RuntimeError, match="shared/shared buffers"):
-        _compile_forced_dispatch("wave64_xor", "shared", "global")
+        _lower_forced_dispatch("wave64_xor", "shared", "global")
     with pytest.raises(RuntimeError, match="shared/shared buffers"):
-        _compile_forced_dispatch("wave64_xor", "global", "shared")
+        _lower_forced_dispatch("wave64_xor", "global", "shared")
 
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not env.has_maca(), reason="need maca")
-@needs_maca
 @pytest.mark.parametrize("shared_side", ["src", "dst"])
 def test_mixed_shared_global_fallback(shared_side):
     shape = (4, 32)
@@ -642,7 +643,6 @@ def test_mixed_shared_global_fallback(shared_side):
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not env.has_maca(), reason="need maca")
-@needs_maca
 def test_shared_shared_uncertified_schedule_uses_generic_fallback():
     shape = (64, 32)
     pre = TileLayout(S[shape : (32, 1)])
@@ -683,7 +683,7 @@ def test_shared_shared_uncertified_schedule_uses_generic_fallback():
 )
 def test_reject_vector_and_128_bit_scalar(dtype, message):
     with pytest.raises(RuntimeError, match=message):
-        _compile_forced_dispatch("wave64_generic", dtype=dtype)
+        _lower_forced_dispatch("wave64_generic", dtype=dtype)
 
 
 if __name__ == "__main__":

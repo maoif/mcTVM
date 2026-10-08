@@ -34,7 +34,9 @@ MACA variants
 MACA registers two variants: ``wave64_xor`` (priority 40) and
 ``wave64_generic`` (priority 10). Both require warp scope, a one-dimensional
 full Wave64 lane range ``[0, 64)``, equal static slice extents, plain
-``TileLayout`` objects, and bijective sliced layouts. Scalar element widths of
+``TileLayout`` objects, and bijective sliced layouts. Operands must use global
+or shared storage; thread-private local buffers are rejected because the
+cooperative staging partitions the slice across lanes. Scalar element widths of
 1, 2, 4, and 8 bytes are supported. Vector elements and 16-byte scalar
 elements are rejected explicitly.
 
@@ -84,7 +86,8 @@ The implementation first builds a common permutation plan:
        ``wave64_generic`` priority 10
    * - operands
      - equal dtype, equal (compile-time) extents; both plain ``TileLayout`` (no
-       swizzle wrapper); scalar dtype byte width ∈ {1, 2, 4, 8}; vector and
+       swizzle wrapper); global or shared storage only;
+       scalar dtype byte width ∈ {1, 2, 4, 8}; vector and
        16-byte scalar elements are rejected; ordinary typed buffer loads and
        stores
    * - launch / volume

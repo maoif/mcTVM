@@ -232,8 +232,8 @@ def _gather(op_call):
 def analyze_common(op_call, sctx):
     """Build the variant-independent permutation plan.
 
-    This validates target/scope, static matching regions, supported element
-    widths, plain layouts, and layout bijections.  Optimization-specific
+    This validates target/scope, global/shared storage, static matching regions,
+    supported element widths, plain layouts, and layout bijections.  Optimization-specific
     decisions such as XOR availability are intentionally left to dispatch
     variants so a valid operation can fall back to the generic path.
     """
@@ -257,6 +257,12 @@ def analyze_common(op_call, sctx):
         return None, "multi-dim threadIdx is not supported"
 
     src_buf, src_st, src_ext, dst_buf, dst_st, dst_ext = _gather(op_call)
+
+    for side, buf in (("src", src_buf), ("dst", dst_buf)):
+        if buf.scope().split(".", 1)[0] not in ("global", "shared"):
+            return None, (
+                f"permute_layout requires global or shared storage; {side} scope is {buf.scope()!r}"
+            )
 
     if src_buf.dtype != dst_buf.dtype:
         return None, f"dtype mismatch: dst={dst_buf.dtype} vs src={src_buf.dtype}"
